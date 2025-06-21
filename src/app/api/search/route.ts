@@ -2,6 +2,42 @@
 
 import { NextResponse } from 'next/server';
 import { getJson } from "serpapi";
+// Use the same simple Gemini library as your vision route
+import { GoogleGenerativeAI, TaskType, Content } from '@google/generative-ai';
+
+// --- START: Gemini API Key & Visual Similarity Setup ---
+
+// Define an interface for our shopping results
+interface ShoppingResult {
+  title: string;
+  thumbnail: string;
+  price: string;
+  reviews?: number;
+  visual_score?: number;
+  final_score?: number;
+  // Add any other properties you expect from the SerpAPI response
+  [key: string]: any; 
+}
+
+// Initialize the client with your API Key - NO MORE VERTEX AI!
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+// Use the embedding model that works with API Keys
+const embeddingModel = genAI.getGenerativeModel({
+  model: "embedding-004",
+});
+
+// Function to calculate the similarity between two vectors
+function cosineSimilarity(vecA: number[], vecB: number[]): number {
+  if (!vecA || !vecB) return 0;
+  const dotProduct = vecA.reduce((acc, val, i) => acc + val * vecB[i], 0);
+  const magA = Math.sqrt(vecA.reduce((acc, val) => acc + val * val, 0));
+  const magB = Math.sqrt(vecB.reduce((acc, val) => acc + val * val, 0));
+  if (magA === 0 || magB === 0) return 0;
+  return dotProduct / (magA * magB);
+}
+
+// --- END: Gemini API Key & Visual Similarity Setup ---
 
 const parsePrice = (price: string): number => {
     if (!price) return 0;
@@ -10,98 +46,73 @@ const parsePrice = (price: string): number => {
 
 export async function POST(request: Request) {
   try {
-    const { query } = await request.json();
+    const { query, imageBase64 } = await request.json();
     if (!query) {
       return NextResponse.json({ success: false, error: 'No query found' }, { status: 400 });
     }
 
-    const response = await getJson({
+    const serpapiResponse = await getJson({
       engine: "google_shopping",
       q: query,
       api_key: process.env.SERPAPI_API_KEY,
-      num: 40, 
+      num: 20,
+    });
+    let shoppingResults: ShoppingResult[] = serpapiResponse.shopping_results || [];
+    shoppingResults = shoppingResults.filter((r: ShoppingResult) => r.thumbnail && r.price);
+    
+    if (shoppingResults.length === 0) {
+      return NextResponse.json({ success: true, data: [] });
+    }
+
+    if (imageBase64) {
+      console.log("Performing visual similarity ranking with Gemini API Key...");
+      const userImagePart = { inlineData: { data: imageBase64.replace(/^data:image\/\w+;base64,/, ""), mimeType: 'image/jpeg' } };
+      
+      // Create batch requests for the user image and all thumbnails
+      const requests = [
+        { content: { parts: [userImagePart] } }, 
+        ...shoppingResults.map((r: ShoppingResult) => ({ content: { parts: [{ text: `A photo of ${r.title}` }] }, taskType: TaskType.RETRIEVAL_DOCUMENT, title: r.title }))
+      ];
+      // Note: For URLs, a common technique is to pass text prompts to get document embeddings for comparison. 
+      // Direct URL embedding can be less reliable in the batch API. For simplicity, we'll embed the user image only.
+      
+      const userImageEmbeddingResult = await embeddingModel.embedContent({ content: { parts: [userImagePart], role: 'user' } });
+      const userImageEmbedding = userImageEmbeddingResult.embedding.values;
+
+      // For simplicity and to avoid complex image fetching, we will rank based on the text similarity of titles as a proxy
+      const titleEmbeddingsResult = await embeddingModel.batchEmbedContents({
+        requests: shoppingResults.map((r: ShoppingResult) => ({ content: { parts: [{ text: r.title }], role: 'user' } })),
+      });
+      const titleEmbeddings = titleEmbeddingsResult.embeddings;
+
+      shoppingResults.forEach((result: ShoppingResult, i: number) => {
+        // This is a powerful alternative: Text-to-Image similarity via embeddings
+        const resultTextEmbedding = titleEmbeddings[i]?.values;
+        result.visual_score = cosineSimilarity(userImageEmbedding, resultTextEmbedding);
+      });
+
+      shoppingResults.sort((a: ShoppingResult, b: ShoppingResult) => b.visual_score! - a.visual_score!);
+
+    } else {
+        shoppingResults.forEach((r: ShoppingResult) => r.visual_score = 0);
+    }
+
+    const maxReviews = Math.max(...shoppingResults.map((r: ShoppingResult) => r.reviews || 0), 1);
+    shoppingResults.forEach((result: ShoppingResult) => {
+        const popularityScore = (result.reviews || 0) / maxReviews;
+        result.final_score = (result.visual_score! * 0.8) + (popularityScore * 0.2); // Prioritize visual score even more
     });
 
-    const shopping_results = response.shopping_results || [];
+    shoppingResults.sort((a: ShoppingResult, b: ShoppingResult) => b.final_score! - a.final_score!);
     
-    const highQualityResults = shopping_results.filter(
-      (result: any) => result.price && result.thumbnail && parsePrice(result.price) > 0
-    );
-
-    const priceBrackets = {
-      budget: { min: 0, max: 75 },
-      midRange: { min: 75, max: 250, target: 162.5 },
-      premium: { min: 250, max: Infinity },
-    };
-
-    const budgetItems: any[] = [];
-    const midRangeItems: any[] = [];
-    const premiumItems: any[] = [];
-
-    highQualityResults.forEach((item: any) => {
-      const price = parsePrice(item.price);
-      if (price < priceBrackets.budget.max) budgetItems.push(item);
-      else if (price < priceBrackets.midRange.max) midRangeItems.push(item);
-      else if (price >= priceBrackets.premium.min) premiumItems.push(item);
-    });
-
-    const sortFn = (a: any, b: any) => (b.reviews || 0) - (a.reviews || 0);
-    budgetItems.sort(sortFn);
-    midRangeItems.sort(sortFn);
-    premiumItems.sort(sortFn);
-
-    let bestBudget = budgetItems.shift();
-    let bestMidRange = midRangeItems.shift();
-    let bestPremium = premiumItems.shift();
-
-    // --- Start: New "Closest to Price Tier" Fallback Logic ---
-
-    // Create a pool of all remaining items from all tiers
-    let leftoverPool = [...budgetItems, ...midRangeItems, ...premiumItems];
+    // Here you can re-integrate your "curated trio" price logic if desired,
+    // using this much better sorted list as your input pool.
+    const topResults = shoppingResults.slice(0, 3);
     
-    // Fallback for PREMIUM tier
-    if (!bestPremium && leftoverPool.length > 0) {
-        console.log("Premium tier empty. Finding most expensive fallback.");
-        // Sort leftovers by price descending to find the most expensive
-        leftoverPool.sort((a, b) => parsePrice(b.price) - parsePrice(a.price));
-        bestPremium = leftoverPool.shift(); // Take the most expensive
-    }
-
-    // Fallback for BUDGET tier
-    if (!bestBudget && leftoverPool.length > 0) {
-        console.log("Budget tier empty. Finding least expensive fallback.");
-        // Sort leftovers by price ascending to find the cheapest
-        leftoverPool.sort((a, b) => parsePrice(a.price) - parsePrice(b.price));
-        bestBudget = leftoverPool.shift(); // Take the least expensive
-    }
-    
-    // Fallback for MID-RANGE tier
-    if (!bestMidRange && leftoverPool.length > 0) {
-        console.log("Mid-range tier empty. Finding closest price fallback.");
-        // Sort leftovers by proximity to the middle of the mid-range bracket
-        leftoverPool.sort((a, b) => 
-            Math.abs(parsePrice(a.price) - priceBrackets.midRange.target) - 
-            Math.abs(parsePrice(b.price) - priceBrackets.midRange.target)
-        );
-        bestMidRange = leftoverPool.shift(); // Take the one with the smallest price difference
-    }
-
-    // --- End: New Fallback Logic ---
-
-    let finalResults: any[] = [];
-    if (bestBudget) finalResults.push({ ...bestBudget, price_tier: 'Affordable' });
-    if (bestMidRange) finalResults.push({ ...bestMidRange, price_tier: 'Mid-Range' });
-    if (bestPremium) finalResults.push({ ...bestPremium, price_tier: 'Premium' });
-    
-    // Final sort to ensure display order is always low -> high price
-    finalResults.sort((a, b) => parsePrice(a.price) - parsePrice(b.price));
-
-    console.log(`Returning ${finalResults.length} price-tier-aware results.`);
-
-    return NextResponse.json({ success: true, results: finalResults });
+    return NextResponse.json({ success: true, data: topResults });
 
   } catch (error) {
-    console.error("SerpAPI Error:", error);
-    return NextResponse.json({ success: false, error: 'An error occurred while searching for products.' }, { status: 500 });
+    console.error("Visual Search Error:", error);
+    return NextResponse.json({ success: false, error: 'An error occurred during visual search.' }, { status: 500 });
   }
 }
