@@ -31,7 +31,7 @@ const singleItemPrompt = `
 
 // Helper function to call Gemini and parse the JSON response
 async function callGemini(imagePart: any, prompt: string) {
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
+  const model = genAI.getGenerativeModel({ model: "models/gemini-2.5-flash" });
   const result = await model.generateContent([prompt, imagePart]);
   const response = result.response;
   const rawJsonText = response.text();

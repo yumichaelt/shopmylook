@@ -32,7 +32,8 @@ export default function HomePage() {
   const [visionData, setVisionData] = useState<VisionApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-  const [searchingItem, setSearchingItem] = useState<string | null>(null);
+  const [imageBase64, setImageBase64] = useState<string | null>(null);
+  const [isSearching, setIsSearching] = useState<Set<string>>(new Set());
   const [searchError, setSearchError] = useState<string | null>(null);
   
   // Function to convert file to base64
@@ -52,11 +53,12 @@ export default function HomePage() {
     setError(null);
     setVisionData(null);
     setSearchResults([]);
-    setSearchingItem(null);
+    setIsSearching(new Set());
     setSearchError(null);
 
     try {
       const base64Image = await toBase64(file);
+      setImageBase64(base64Image);
       
       const response = await fetch('/api/vision', {
         method: 'POST',
@@ -80,8 +82,10 @@ export default function HomePage() {
   };
 
   // Function to search for products
-  const handleSearch = async (query: string, itemName: string) => {
-    setSearchingItem(itemName);
+  const handleItemSearch = async (searchQuery: string) => {
+    if (!searchQuery || isSearching.has(searchQuery)) return;
+
+    setIsSearching(prev => new Set(prev).add(searchQuery));
     setSearchResults([]);
     setSearchError(null);
 
@@ -89,7 +93,7 @@ export default function HomePage() {
       const response = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query: searchQuery, imageBase64 }),
       });
 
       if (!response.ok) {
@@ -103,12 +107,16 @@ export default function HomePage() {
         throw new Error(data.error || 'Search failed');
       }
       
-      setSearchResults(data.results || []);
+      setSearchResults(data.data || []);
       
     } catch (err: any) {
       setSearchError(err.message || 'An error occurred while searching for products.');
     } finally {
-      // Keep searchingItem set so we know which item was searched
+      setIsSearching(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(searchQuery);
+        return newSet;
+      });
     }
   };
 
@@ -146,11 +154,12 @@ export default function HomePage() {
                 <div className="mt-2 text-xs text-gray-500">
                   <span>Category: {item.category}</span> | <span>Significance: {item.significance_score}/10</span>
                 </div>
-                <button 
-                  className="mt-3 text-sm font-medium text-blue-600 hover:underline"
-                  onClick={() => handleSearch(item.search_query, item.item_name)}
+                <button
+                  onClick={() => handleItemSearch(item.search_query)}
+                  disabled={isSearching.size > 0}
+                  className="mt-3 text-sm font-medium text-blue-600 hover:underline disabled:text-gray-400 disabled:no-underline"
                 >
-                  Find similar items &rarr;
+                  {isSearching.has(item.search_query) ? 'Searching...' : `Find similar items →`}
                 </button>
               </li>
             ))}
@@ -158,18 +167,23 @@ export default function HomePage() {
         </div>
       )}
 
-      {searchingItem && (
+      {isSearching.size > 0 && searchResults.length === 0 && (
         <div className="mt-8 border-t pt-6">
-          <h2 className="text-2xl font-bold mb-4">Shopping Results for {searchingItem}</h2>
+          <h2 className="text-2xl font-bold mb-4">Shopping Results</h2>
+          <p className="text-center text-gray-600">Searching for products...</p>
+        </div>
+      )}
+
+      {searchResults.length > 0 && (
+        <div className="mt-8 border-t pt-6">
+          <h2 className="text-2xl font-bold mb-4">Shopping Results</h2>
           
           {searchError && (
             <p className="my-4 text-center text-red-600 bg-red-100 p-3 rounded-lg">Error: {searchError}</p>
           )}
           
-          {searchResults.length === 0 ? (
-            <p className="text-center text-gray-600">
-              {!searchError ? "Searching for products..." : "No products found. Try a different search."}
-            </p>
+          {!searchError && searchResults.length === 0 ? (
+            <p className="text-center text-gray-600">No products found. Try a different search.</p>
           ) : (
             <div className="space-y-6">
               {['Affordable', 'Mid-Range', 'Premium'].map((tier) => {
